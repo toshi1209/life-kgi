@@ -1,0 +1,11 @@
+services:
+  web:
+    build: .
+    ports:
+      - "8787:8787"
+    environment:
+      LIFE_KGI_HOST: "0.0.0.0"
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    volumes:
+      - ${HOME}/.claude:/root/.claude
+    restart: unless-stopped
