@@ -1,14 +1,13 @@
 # KGI 分岐
 
-KGI を頂点にしたツリーを、ブラウザで見る。中身はコンテナから `claude --bare -p` を投げる。
+KGI を頂点にしたツリーをブラウザで見る。サーバもフロントも TypeScript。起動は npm だけ。
 
-フロントは TypeScript（Vite）。API は Python。
-
-## Docker で起動（推奨）
+内部は `claude --bare -p`。
 
 ```bash
-cd life-kgi
-docker compose up --build
+npm install
+npm run build
+npm start
 ```
 
-ブラウザ: http://localhost:8787
+http://localhost:8787
