@@ -8,4 +8,5 @@ services:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
     volumes:
       - ${HOME}/.claude:/root/.claude
+      - ./data:/app/data
     restart: unless-stopped

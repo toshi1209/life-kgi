@@ -11,8 +11,49 @@ export type Path = {
   risk?: string;
   skills_kpi?: { skills?: Skill[]; kpis?: { leading?: Kpi[]; lagging?: Kpi[] }; "90_day_sprint"?: string[] };
   future?: { snapshots?: Snapshot[]; if_it_fails?: string; if_it_works?: string };
+  story_map?: StoryMap;
+  learning?: Learning;
+  study_plan?: StudyPlan;
+  mbti_fit?: MbtiFit;
 };
-export type PlanDoc = { kgi?: string; horizon_years?: number; paths?: Path[] };
+export type MbtiRank = "A" | "B" | "C";
+export type MbtiFit = { rank: MbtiRank; reason?: string };
+export const MBTI_TYPES = ["INTJ", "INTP", "ENTJ", "ENTP", "INFJ", "INFP", "ENFJ", "ENFP", "ISTJ", "ISFJ", "ESTJ", "ESFJ", "ISTP", "ISFP", "ESTP", "ESFP"] as const;
+export type StoryLane = "do" | "learn" | "prove" | "measure";
+export type StoryPhase = { name: string; period?: string; goal?: string; story?: string };
+export type StoryCard = {
+  phase: number;
+  lane: StoryLane;
+  title: string;
+  detail?: string;
+  priority: number;
+  first_90_days: boolean;
+  done_when?: string;
+  skill?: string;
+};
+export type StoryMap = { phases: StoryPhase[]; cards: StoryCard[] };
+export type Resource = { title: string; url: string; type?: string; cost?: string; language?: string; why?: string };
+export type LearningItem = { skill: string; why?: string; level?: string; resources: Resource[] };
+export type Learning = { items: LearningItem[] };
+export type StudyWindow = { dow: number; start: string; end: string };
+export type StudySettings = { start_date: string; weekly_max_hours: number; session_max_minutes: number; windows: StudyWindow[] };
+export type SessionTemplate = { id: string; skill: string; title: string; minutes: number; resource_title?: string; resource_url?: string; what?: string };
+export type StudySession = {
+  id: string;
+  template_id: string;
+  skill: string;
+  title: string;
+  date: string;
+  start: string;
+  end: string;
+  minutes: number;
+  part: number;
+  resource_title?: string;
+  resource_url?: string;
+  what?: string;
+};
+export type StudyPlan = { settings: StudySettings; templates: SessionTemplate[]; sessions: StudySession[]; done: string[]; done_at?: Record<string, string>; unscheduled: number; generated_at: string };
+export type PlanDoc = { kgi?: string; horizon_years?: number; paths?: Path[]; chosen_path?: number; mbti?: string; mbti_note?: string };
 export type Payload = {
   kgi: FormDataEntryValue | null;
   context: FormDataEntryValue | null;
@@ -20,4 +61,23 @@ export type Payload = {
   horizon_years: number;
   model: string | null;
   paths_doc?: PlanDoc;
+  /** 深掘り時に既存プランを更新したいとき */
+  plan_id?: number;
+  mbti?: string | null;
 };
+export type Stage = "paths" | "enriched" | "story";
+export type PlanRow = {
+  id: number;
+  title: string;
+  kgi: string;
+  context: string;
+  n_paths: number;
+  horizon_years: number;
+  model: string | null;
+  stage: Stage;
+  chosen_path: number | null;
+  created_at: string;
+  updated_at: string;
+};
+/** 生成系 POST と GET /api/plans/:id の応答 */
+export type PlanResponse = { plan: PlanRow; doc: PlanDoc };
