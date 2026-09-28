@@ -99,3 +99,7 @@ npm run dev        # サーバを watch 起動（フロントは npm run build �
 npm test           # node:test（DB 層と JSON→木 変換）
 npm run kgi -- "KGI" [-c 状況] [-n 4]   # CLI。DB には保存しない
 ```
+
+## ライセンス
+
+MIT（[LICENSE](LICENSE)）
