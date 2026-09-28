@@ -1,6 +1,6 @@
 # KGI 分岐
 
-KGI を頂点にしたツリーをブラウザで見る。サーバもフロントも TypeScript。起動は npm だけ。
+人生の MVV（ミッション・ビジョン・バリュー）→ 測れる KGI → 全部の道で共通の KPI を決めてから、KGI に向かう「道」を分岐させてツリーで見る。サーバもフロントも TypeScript。起動は npm だけ。
 
 内部は `claude -p`。生成結果は SQLite に自動保存される。
 
@@ -14,9 +14,22 @@ http://localhost:8787
 
 ## 画面
 
-- 左: 入力フォームと保存済み一覧（クリックで再表示、× で削除）
-- 中央: 横方向のノードリンク図。ドラッグで移動、ホイールで拡大縮小、○ で開閉、ノードをクリックで詳細
+- 左: 「新しく始める」、前提・道の数・年数・MBTI・モデル、各ボタン、保存済み一覧（クリックで再表示、× で削除）
+- 中央: タブ。土台 / ツリー（横方向のノードリンク図。ドラッグで移動、ホイールで拡大縮小、○ で開閉、ノードをクリックで詳細）/ 比較 / ストーリーマップ / カレンダー / 成長
 - 右: 選んだノードの全文と key/value
+
+## 土台: MVV → KGI → 共通 KPI（道を出す前に決める）
+
+仕様: [docs/superpowers/specs/2026-09-28-mvv-kgi-kpi-foundation-design.md](docs/superpowers/specs/2026-09-28-mvv-kgi-kpi-foundation-design.md)
+
+- ① MVV: 質問シート 7 問（任意）と「前提・状況」から候補 3 案（`POST /api/mvv`、`prompts/mvv.txt`）。1 案を選んで手で直し「MVV を確定」（`POST /api/foundation { mvv }`）。MVV を飛ばして KGI を自分で書いてもよい。
+- ② KGI: 確定した MVV から候補 3 案（`POST /api/kgi`、`prompts/kgi.txt`）。一文・何を数えるか・目標値（数字と単位）・期限（YYYY-MM）・測り方がそろわないと確定できない（`src/kgi.ts` の `kgiProblems`。画面とサーバで共有。「〜したい」の願望形も弾く）。
+- ③ KPI: KGI の分解式と、道に依存しない KPI 3〜6 個（`POST /api/kpis`、`prompts/kpis.txt`）。手では直さず作り直すだけ。
+- 「この KPI で道を出す」→ `POST /api/paths { plan_id }`。KGI は言い換えさせず、各道に `kpi_plan`（共通 KPI ごとの見込みと動かし方）。続けてバリューとの合い具合（`POST /api/values_fit`、`prompts/values_fit.txt`。A/B/C とバリューごとの ○△×）を別の呼び出しで評価する。ツリーの道ノードに `V:A` バッジ。
+- 「比較」タブ: 列が道、行が 概要・バリュー・MBTI・難しさ・共通 KPI の見込み。列ごとに「この道で進める」。
+- 変更のルール: 道を出す前は、MVV を確定し直すと KGI・KPI が、KGI を確定し直すと KPI が消える。道を出した後は土台は読み取り専用（409）で、「この土台で新しいプランを始める」（`POST /api/plans/:id/duplicate`）で複製して直す。ストーリーマップを作った道があるプランは道を作り直せない。
+- 保存: `doc.mvv_answers` / `mvv_candidates` / `mvv` / `kgi_candidates` / `kgi_spec` / `kpi_tree`、`doc.paths[i].kpi_plan` / `values_fit`。段階は `mvv` → `kgi` → `kpi` → `paths`。
+- MVV なしで作った旧プランもそのまま開ける。深掘り・ストーリーマップ・難しさ・質問にも土台を渡す（`foundationInput`）。
 
 ## 道を決めたら: ストーリーマップと教材
 
@@ -48,6 +61,11 @@ http://localhost:8787
 - ツリーの道ノードにランクのバッジ（A=緑、B=青、C=灰）、道の詳細に「おすすめ度: A — 理由」、根の詳細に MBTI・おすすめ順・注記。
 - MBTI は自己申告の参考情報という前提で、理由は「営業の頻度」「孤独な作業の量」など検証できる行動で書かせている。
 
+## 道の難しさと、道についての質問
+
+- 「難しさを出す」（`POST /api/difficulty { plan_id }`、`prompts/difficulty.txt`、約 1 分）で各道に総合 ★1〜5 と観点別（時間・資金・スキル差・不確実さ・生活負担、各 1〜5）、一番の壁、理由を付ける（`doc.paths[i].difficulty`）。ユーザの context に対する相対評価。ツリーの道ノードに ★ バッジ、根の詳細に難しさ順。
+- ツリーで道を選ぶと右パネルに「この道について質問」。`POST /api/qa { plan_id, path_index, question }`（`prompts/qa.txt`、本文テキストで回答、30〜90 秒）。入力には KGI・context・MBTI・その道の全情報（qa 以外。学習計画は設定と雛形のみ）・直近 6 往復の履歴を渡す。やり取りは `doc.paths[i].qa[]` に保存（最大 50 件）。Cmd/Ctrl+Enter でも送信。
+
 ## claude の認証
 
 - `ANTHROPIC_API_KEY` があれば `claude --bare -p`（設定・hooks・MCP を一切読まない最小モード）
@@ -68,7 +86,8 @@ Node 22 内蔵の `node:sqlite` を使う。追加パッケージ・ネイティ
   - `GET /api/plans` 一覧（doc なし、更新が新しい順）
   - `GET /api/plans/:id` → `{ plan, doc }`
   - `DELETE /api/plans/:id`
-  - `POST /api/paths` / `POST /api/full` → `{ plan, doc }`（新規保存）
+  - `POST /api/paths` / `POST /api/full` → `{ plan, doc }`（`plan_id` なしは KGI 直入力の従来どおり新規保存。`plan_id` 付きの `/api/paths` はそのプランの土台で道を出す）
+  - `POST /api/mvv` / `POST /api/kgi` / `POST /api/kpis` / `POST /api/foundation` / `POST /api/values_fit` / `POST /api/plans/:id/duplicate` → `{ plan, doc }`（土台）
   - `POST /api/enrich`（`plan_id` を渡すと既存を更新）→ `{ plan, doc }`
   - `POST /api/story` / `POST /api/learning`（`{ plan_id, path_index }`）→ `{ plan, doc }`
   - `POST /api/study_plan` / `POST /api/study_plan/allocate` / `POST /api/study_plan/done` → `{ plan, doc }`

@@ -109,3 +109,26 @@ test("旧スキーマ（CHECK 制約あり）の DB は起動時に移行され�
   s2.close();
   rmSync(dir, { recursive: true, force: true });
 });
+
+test("土台の stage（mvv / kgi / kpi）が使え、title を指定して作れる", () => {
+  const s = new PlanStore(":memory:");
+  const row = s.insert({ ...base, kgi: "", title: "目の前の人を笑顔にする", stage: "mvv", doc: {} });
+  assert.equal(row.title, "目の前の人を笑顔にする");
+  assert.equal(row.kgi, "");
+  assert.equal(s.update(row.id, { doc: {}, stage: "kgi" })?.stage, "kgi");
+  assert.equal(s.update(row.id, { doc: {}, stage: "kpi" })?.stage, "kpi");
+  s.close();
+});
+
+test("update の meta で title / kgi / context / n_paths / horizon_years / model を変えられる", () => {
+  const s = new PlanStore(":memory:");
+  const row = s.insert({ ...base, stage: "mvv", doc: {} });
+  const upd = s.update(row.id, { doc: {}, stage: "kgi", meta: { title: "T", kgi: "K2", context: "C2", n_paths: 5, horizon_years: 7, model: "m" } });
+  assert.deepEqual(
+    [upd?.title, upd?.kgi, upd?.context, upd?.n_paths, upd?.horizon_years, upd?.model],
+    ["T", "K2", "C2", 5, 7, "m"],
+  );
+  const keep = s.update(row.id, { doc: {}, stage: "kgi", meta: { context: "C3" } });
+  assert.deepEqual([keep?.title, keep?.kgi, keep?.context, keep?.n_paths], ["T", "K2", "C3", 5], "渡さなかった列は変えない");
+  s.close();
+});

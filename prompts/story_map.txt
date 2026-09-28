@@ -16,5 +16,9 @@
 - 推測で盛らず、ユーザーの context（年齢、家族、貯蓄、経験）に合った現実的な内容にする。
 - 日本語で書く。
 
+入力に kpis（共通 KPI）があるとき:
+- measure レーンのカードは共通 KPI を使う。title か detail に KPI の id（例: "K1"）を入れ、done_when は KPI の targets と矛盾させない。
+- KGI は kgi_spec をそのまま使い、言い換えない。
+
 出力は次の JSON だけ（前後に説明やコードフェンスを付けない）:
 {"phases":[{"name":"","period":"","goal":"","story":""}],"cards":[{"phase":0,"lane":"do","title":"","detail":"","priority":1,"first_90_days":true,"done_when":"","skill":""}]}

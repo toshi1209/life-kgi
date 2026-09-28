@@ -6,8 +6,9 @@ import type { PlanDoc } from "./engine.ts";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 
-export type Stage = "paths" | "enriched" | "story";
-const STAGES: readonly Stage[] = ["paths", "enriched", "story"];
+/** mvv / kgi / kpi は土台（道を出す前）の段階 */
+export type Stage = "mvv" | "kgi" | "kpi" | "paths" | "enriched" | "story";
+const STAGES: readonly Stage[] = ["mvv", "kgi", "kpi", "paths", "enriched", "story"];
 
 export type PlanRow = {
   id: number;
@@ -25,6 +26,8 @@ export type PlanRow = {
 };
 
 export type NewPlan = {
+  /** 省略時は kgi から作る */
+  title?: string;
   kgi: string;
   context?: string;
   n_paths: number;
@@ -33,6 +36,8 @@ export type NewPlan = {
   stage: Stage;
   doc: PlanDoc;
 };
+
+export type PlanMeta = { title?: string; kgi?: string; context?: string; n_paths?: number; horizon_years?: number; model?: string | null };
 
 const COLS = "id, title, kgi, context, n_paths, horizon_years, model, stage, json_extract(doc, '$.chosen_path') AS chosen_path, created_at, updated_at";
 
@@ -100,16 +105,24 @@ export class PlanStore {
         `INSERT INTO plans (title, kgi, context, n_paths, horizon_years, model, stage, doc, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(titleOf(p.kgi), p.kgi, p.context ?? "", p.n_paths, p.horizon_years, p.model ?? null, p.stage, JSON.stringify(p.doc), now, now);
+      .run(titleOf(p.title ?? p.kgi), p.kgi, p.context ?? "", p.n_paths, p.horizon_years, p.model ?? null, p.stage, JSON.stringify(p.doc), now, now);
     return this.row(Number(r.lastInsertRowid))!;
   }
 
-  update(id: number, patch: { doc: PlanDoc; stage: Stage }): PlanRow | null {
+  /** meta に渡した列だけ書き換える（土台の段階で KGI や状況が後から決まるため） */
+  update(id: number, patch: { doc: PlanDoc; stage: Stage; meta?: PlanMeta }): PlanRow | null {
     assertStage(patch.stage);
     const now = new Date().toISOString();
-    const r = this.db
-      .prepare(`UPDATE plans SET doc = ?, stage = ?, updated_at = ? WHERE id = ?`)
-      .run(JSON.stringify(patch.doc), patch.stage, now, id);
+    const sets = ["doc = ?", "stage = ?", "updated_at = ?"];
+    const vals: (string | number | null)[] = [JSON.stringify(patch.doc), patch.stage, now];
+    const m = patch.meta ?? {};
+    if (m.title !== undefined) { sets.push("title = ?"); vals.push(titleOf(m.title)); }
+    if (m.kgi !== undefined) { sets.push("kgi = ?"); vals.push(m.kgi); }
+    if (m.context !== undefined) { sets.push("context = ?"); vals.push(m.context); }
+    if (m.n_paths !== undefined) { sets.push("n_paths = ?"); vals.push(m.n_paths); }
+    if (m.horizon_years !== undefined) { sets.push("horizon_years = ?"); vals.push(m.horizon_years); }
+    if (m.model !== undefined) { sets.push("model = ?"); vals.push(m.model); }
+    const r = this.db.prepare(`UPDATE plans SET ${sets.join(", ")} WHERE id = ?`).run(...vals, id);
     return r.changes ? this.row(id) : null;
   }
 

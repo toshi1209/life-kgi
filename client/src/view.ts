@@ -11,7 +11,10 @@ const MIN_W = 56;
 const MAX_W = 290;
 const PAD = 40;
 const INITIAL_DEPTH = 2; // ここまでの深さは最初から展開
-const BADGE_W = 24; // ランクバッジぶんの余白
+const BADGE_GAP = 4;
+function badgeWidth(text: string): number {
+  return Math.max(18, textWidth(text) + 8);
+}
 
 function textWidth(s: string): number {
   let w = 0;
@@ -132,8 +135,12 @@ export class TreeView {
     this.applyTransform();
   }
 
+  private badgesWidth(n: TreeNode): number {
+    return (n.badges ?? []).reduce((w, b) => w + badgeWidth(b.text) + BADGE_GAP, 0);
+  }
+
   private nodeWidth(n: TreeNode): number {
-    return Math.min(MAX_W, Math.max(MIN_W, textWidth(n.label) + 24 + (n.badge ? BADGE_W : 0)));
+    return Math.min(MAX_W, Math.max(MIN_W, textWidth(n.label) + 24 + this.badgesWidth(n)));
   }
 
   render(): void {
@@ -161,17 +168,21 @@ export class TreeView {
         transform: `translate(${n.y},${n.x - NODE_H / 2})`,
       });
       g.append(el("rect", { width: w, height: NODE_H, rx: 6 }));
-      const offset = d.badge ? BADGE_W : 0;
-      if (d.badge) {
-        const b = el("g", { class: `badge rank-${d.badge}`, transform: `translate(7,${NODE_H / 2 - 8})` });
-        b.append(el("rect", { width: 18, height: 16, rx: 8 }));
-        const bt = el("text", { x: 9, y: 12, "text-anchor": "middle" });
-        bt.textContent = d.badge;
+      let offset = 0;
+      for (const badge of d.badges ?? []) {
+        const bw = badgeWidth(badge.text);
+        const b = el("g", { class: `badge ${badge.cls}`, transform: `translate(${7 + offset},${NODE_H / 2 - 8})` });
+        b.append(el("rect", { width: bw, height: 16, rx: 8 }));
+        const bt = el("text", { x: bw / 2, y: 12, "text-anchor": "middle" });
+        bt.textContent = badge.text;
         b.append(bt);
-        const title = el("title");
-        title.textContent = `MBTI のおすすめ度 ${d.badge}`;
-        b.append(title);
+        if (badge.title) {
+          const title = el("title");
+          title.textContent = badge.title;
+          b.append(title);
+        }
         g.append(b);
+        offset += bw + BADGE_GAP;
       }
       const t = el("text", { x: 10 + offset, y: NODE_H / 2 + 4 });
       t.textContent = fitLabel(d.label, w - 20 - offset);

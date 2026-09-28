@@ -152,3 +152,36 @@ test("normalizeMbtiFit は添字とランクを検証し、道ごとに並べる
   assert.equal(r.note, "参考です");
   assert.throws(() => normalizeMbtiFit({ ranks: [] }, 2), /ranks/);
 });
+
+import { answerQuestion, normalizeDifficulty } from "./engine.ts";
+
+test("normalizeDifficulty は 1〜5 に丸め、添字で並べ、不正な項目は捨てる", () => {
+  const d = normalizeDifficulty({ paths: [
+    { path: 1, overall: "4", aspects: { time: 9, money: 0, skill_gap: 3.6, uncertainty: "2", life_load: null }, wall: "資金", reason: "r" },
+    { path: 0, aspects: { time: 2, money: 2, skill_gap: 2, uncertainty: 2, life_load: 2 } },
+    { path: 7, overall: 3 },
+    { path: 0 },
+  ] }, 2);
+  assert.deepEqual(d[1], { overall: 4, aspects: { time: 5, money: 1, skill_gap: 4, uncertainty: 2, life_load: 3 }, wall: "資金", reason: "r" });
+  assert.equal(d[0]?.overall, 2, "overall が無ければ観点の最大値");
+  assert.throws(() => normalizeDifficulty({ paths: [] }, 2), /paths/);
+});
+
+test("answerQuestion は本文テキストをそのまま返し、直近 6 往復だけ渡す", async () => {
+  dir = mkdtempSync(join(tmpdir(), "life-kgi-engine-"));
+  const promptFile = join(dir, "prompt");
+  const bin = join(dir, "claude");
+  writeFileSync(bin, `#!/bin/sh
+prev=""; for a in "$@"; do if [ "$prev" = "-p" ]; then printf '%s' "$a" > "${promptFile}"; fi; prev="$a"; done
+printf '%s\\n' '{"result":"結論: できます。\\n- 補足1\\n- 補足2"}'
+`);
+  chmodSync(bin, 0o755);
+  process.env.CLAUDE_BIN = bin;
+  const history = Array.from({ length: 9 }, (_, i) => ({ q: `q${i}`, a: `a${i}` }));
+  const answer = await answerQuestion({ kgi: "K", path: { name: "A" }, history, question: "本当にできますか？" });
+  assert.equal(answer, "結論: できます。\n- 補足1\n- 補足2");
+  const prompt = readFileSync(promptFile, "utf8");
+  assert.match(prompt, /本当にできますか/);
+  assert.doesNotMatch(prompt, /"q2"/, "古い履歴は落とす");
+  assert.match(prompt, /"q8"/);
+});

@@ -1,15 +1,17 @@
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createServer, type ServerResponse } from "node:http";
 import { stat } from "node:fs/promises";
 import { createReadStream, existsSync } from "node:fs";
 import { dirname, extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
-import { execFileSync } from "node:child_process";
 import {
-  enrichPaths, generateLearning, generateMbtiFit, generatePaths, generateStoryMap, generateStudyTemplates, normalizeMbti, runFull,
-  type Learning, type PlanDoc, type StoryMap, type StudyInputSkill,
+  answerQuestion, enrichPaths, foundationInput, generateDifficulty, generateLearning, generateMbtiFit, generatePaths, generateStoryMap, generateStudyTemplates,
+  normalizeMbti, pathSummaries, runFull,
+  type Learning, type PlanDoc, type QaTurn, type StoryMap, type StudyInputSkill,
 } from "./engine.ts";
 import { allocate, defaultSettings, normalizeSettings, type SessionTemplate, type StudySession, type StudySettings } from "./schedule.ts";
 import { PlanStore, defaultDbPath } from "./db.ts";
+import { claudeOk, readBody, sendJson } from "./http.ts";
+import { FOUNDATION_ROUTES, handleDuplicate, handleFoundation } from "./foundation-api.ts";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const clientDist = join(root, "dist", "client");
@@ -17,15 +19,6 @@ const port = Number(process.env.PORT || 8787);
 const host = process.env.LIFE_KGI_HOST || "0.0.0.0";
 const dbPath = defaultDbPath();
 const store = new PlanStore(dbPath);
-
-function claudeOk(): boolean {
-  try {
-    execFileSync(process.env.CLAUDE_BIN || "claude", ["--version"], { stdio: "ignore", timeout: 5000 });
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 const mime: Record<string, string> = {
   ".html": "text/html; charset=utf-8",
@@ -35,18 +28,6 @@ const mime: Record<string, string> = {
   ".svg": "image/svg+xml",
   ".map": "application/json",
 };
-
-async function sendJson(res: ServerResponse, code: number, body: unknown) {
-  const buf = Buffer.from(JSON.stringify(body));
-  res.writeHead(code, { "Content-Type": "application/json; charset=utf-8", "Content-Length": buf.length });
-  res.end(buf);
-}
-
-async function readBody(req: IncomingMessage): Promise<string> {
-  const chunks: Buffer[] = [];
-  for await (const c of req) chunks.push(c as Buffer);
-  return Buffer.concat(chunks).toString("utf8");
-}
 
 async function serveStatic(urlPath: string, res: ServerResponse) {
   const rel = urlPath === "/" ? "/index.html" : urlPath;
@@ -117,7 +98,7 @@ async function handleStory(pathname: string, data: StoryBody, res: ServerRespons
   const path = paths[idx];
 
   if (pathname === "/api/story") {
-    const story_map = await generateStoryMap({ kgi: plan.kgi, context: plan.context, horizon_years: plan.horizon_years, path }, model);
+    const story_map = await generateStoryMap({ kgi: plan.kgi, context: plan.context, horizon_years: plan.horizon_years, path, ...foundationInput(doc) }, model);
     paths[idx] = { ...path, story_map };
     const next: PlanDoc = { ...doc, paths, chosen_path: idx };
     return sendJson(res, 200, { plan: store.update(id, { doc: next, stage: "story" })!, doc: next });
@@ -241,7 +222,49 @@ async function handleStudy(pathname: string, data: StudyBody, res: ServerRespons
   });
 }
 
-const HEAVY_KEYS = new Set(["skills_kpi", "future", "story_map", "learning", "study_plan", "mbti_fit"]);
+const QA_MAX = 50;
+
+/** 各道の難しさ（★1〜5 ＋ 観点別）を付けて保存する。 */
+async function handleDifficulty(data: { plan_id?: number; model?: string | null }, res: ServerResponse) {
+  const id = Number(data.plan_id);
+  const found = Number.isInteger(id) && id > 0 ? store.get(id) : null;
+  if (!found) return sendJson(res, 404, { error: "plan not found" });
+  const { plan, doc } = found;
+  const paths = doc.paths ?? [];
+  if (!paths.length) return sendJson(res, 400, { error: "道がありません" });
+  if (!claudeOk()) return sendJson(res, 503, { error: "claude CLI がありません。" });
+  const diffs = await generateDifficulty(
+    { kgi: plan.kgi, context: plan.context, horizon_years: plan.horizon_years, paths: pathSummaries(paths), ...foundationInput(doc) },
+    data.model || undefined,
+  );
+  const next: PlanDoc = { ...doc, paths: paths.map((p, i) => (diffs[i] ? { ...p, difficulty: diffs[i] } : p)) };
+  return sendJson(res, 200, { plan: store.update(id, { doc: next, stage: plan.stage })!, doc: next });
+}
+
+/** 道についての質問。道の全情報（qa 以外、study_plan は設定と雛形だけ）と直近の履歴を渡して答える。 */
+async function handleQa(data: { plan_id?: number; path_index?: number; question?: string; model?: string | null }, res: ServerResponse) {
+  const id = Number(data.plan_id);
+  const found = Number.isInteger(id) && id > 0 ? store.get(id) : null;
+  if (!found) return sendJson(res, 404, { error: "plan not found" });
+  const { plan, doc } = found;
+  const paths = doc.paths ?? [];
+  const idx = Number(data.path_index);
+  if (!Number.isInteger(idx) || idx < 0 || idx >= paths.length) return sendJson(res, 400, { error: "path_index が不正" });
+  const question = String(data.question ?? "").trim();
+  if (!question) return sendJson(res, 400, { error: "質問を入力してください" });
+  if (question.length > 2000) return sendJson(res, 400, { error: "質問が長すぎます（2000 文字まで）" });
+  if (!claudeOk()) return sendJson(res, 503, { error: "claude CLI がありません。" });
+  const path = paths[idx];
+  const { qa: _qa, study_plan, ...rest } = path as Record<string, unknown> & { qa?: QaTurn[]; study_plan?: { settings?: unknown; templates?: unknown } };
+  const forPrompt: Record<string, unknown> = { ...rest };
+  if (study_plan && typeof study_plan === "object") forPrompt.study_plan = { settings: study_plan.settings, templates: study_plan.templates };
+  const history = (Array.isArray(_qa) ? _qa : []).map((t) => ({ q: t.q, a: t.a }));
+  const answer = await answerQuestion({ ...foundationInput(doc), kgi: plan.kgi, context: plan.context, mbti: doc.mbti, path: forPrompt, history, question }, data.model || undefined);
+  const qa: QaTurn[] = [...(Array.isArray(_qa) ? _qa : []), { q: question, a: answer, at: new Date().toISOString() }].slice(-QA_MAX);
+  const nextPaths = paths.map((p, i) => (i === idx ? { ...p, qa } : p));
+  const next: PlanDoc = { ...doc, paths: nextPaths };
+  return sendJson(res, 200, { plan: store.update(id, { doc: next, stage: plan.stage })!, doc: next, answer });
+}
 
 /** MBTI から各道のおすすめ度（A/B/C）を付けて保存する。道の重い入れ子は渡さない。 */
 async function handleFit(data: { plan_id?: number; mbti?: string; model?: string | null }, res: ServerResponse) {
@@ -254,12 +277,7 @@ async function handleFit(data: { plan_id?: number; mbti?: string; model?: string
   const paths = doc.paths ?? [];
   if (!paths.length) return sendJson(res, 400, { error: "道がありません" });
   if (!claudeOk()) return sendJson(res, 503, { error: "claude CLI がありません。" });
-  const summaries = paths.map((p, i) => ({
-    path: i,
-    name: String(p.name ?? `道 ${i + 1}`),
-    summary: Object.fromEntries(Object.entries(p).filter(([k]) => !HEAVY_KEYS.has(k) && k !== "name")),
-  }));
-  const { fits, note } = await generateMbtiFit({ mbti, kgi: plan.kgi, context: plan.context, paths: summaries }, data.model || undefined);
+  const { fits, note } = await generateMbtiFit({ mbti, kgi: plan.kgi, context: plan.context, paths: pathSummaries(paths) }, data.model || undefined);
   const nextPaths = paths.map((p, i) => (fits[i] ? { ...p, mbti_fit: fits[i] } : { ...p, mbti_fit: undefined }));
   const next: PlanDoc = { ...doc, paths: nextPaths, mbti, mbti_note: note };
   return sendJson(res, 200, { plan: store.update(id, { doc: next, stage: plan.stage })!, doc: next });
@@ -275,6 +293,8 @@ const server = createServer(async (req, res) => {
     if (req.method === "GET" && pathname === "/api/plans") {
       return await sendJson(res, 200, store.list());
     }
+    const dup = pathname.match(/^\/api\/plans\/(\d+)\/duplicate$/);
+    if (req.method === "POST" && dup) return await handleDuplicate(store, Number(dup[1]), res);
     const m = pathname.match(/^\/api\/plans\/(\d+)$/);
     if (m) {
       const id = Number(m[1]);
@@ -288,6 +308,14 @@ const server = createServer(async (req, res) => {
       }
       res.writeHead(405).end("method");
       return;
+    }
+    if (req.method === "POST" && pathname === "/api/difficulty") {
+      const data = JSON.parse((await readBody(req)) || "{}") as { plan_id?: number; model?: string | null };
+      return await handleDifficulty(data, res);
+    }
+    if (req.method === "POST" && pathname === "/api/qa") {
+      const data = JSON.parse((await readBody(req)) || "{}") as { plan_id?: number; path_index?: number; question?: string; model?: string | null };
+      return await handleQa(data, res);
     }
     if (req.method === "POST" && pathname === "/api/fit") {
       const data = JSON.parse((await readBody(req)) || "{}") as { plan_id?: number; mbti?: string; model?: string | null };
@@ -303,6 +331,8 @@ const server = createServer(async (req, res) => {
     }
     if (req.method === "POST" && pathname.startsWith("/api/")) {
       const data = JSON.parse((await readBody(req)) || "{}") as GenerateBody;
+      // plan_id 付きの /api/paths は、そのプランの土台（MVV・KGI・共通 KPI）で道を出す
+      if (FOUNDATION_ROUTES.has(pathname) || (pathname === "/api/paths" && data.plan_id)) return await handleFoundation(store, pathname, data, res);
       return await handleGenerate(pathname, data, res);
     }
     if (req.method === "GET") { await serveStatic(pathname, res); return; }

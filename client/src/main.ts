@@ -1,13 +1,15 @@
-import { MBTI_TYPES, type PlanResponse, type PlanRow, type Payload, type StoryCard, type StoryPhase, type StudySession, type StudySettings } from "./types";
+import { MBTI_TYPES, type KgiSpec, type Mvv, type MvvAnswer, type PlanResponse, type PlanRow, type Payload, type StoryCard, type StoryPhase, type StudySession, type StudySettings } from "./types";
 import { toTree, type TreeNode } from "./tree";
 import { TreeView } from "./view";
 import { StoryMapView, laneLabel, learningFor, resourceList, type LearningState } from "./storymap";
 import { CalendarView, DOW_LABELS, parseDate } from "./calendar";
 import { computeGrowth } from "./growth";
 import { GrowthView } from "./growthview";
+import { FoundationView } from "./foundation";
+import { CompareView } from "./compare";
 
 type Endpoint = "paths" | "enrich" | "full";
-type Tab = "tree" | "story" | "calendar" | "growth";
+type Tab = "foundation" | "tree" | "compare" | "story" | "calendar" | "growth";
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const form = $<HTMLFormElement>("form");
@@ -18,6 +20,18 @@ const enrichBtn = $<HTMLButtonElement>("enrich");
 const fullBtn = $<HTMLButtonElement>("full");
 const downloadBtn = $<HTMLButtonElement>("download");
 const fitBtn = $<HTMLButtonElement>("fit");
+const difficultyBtn = $<HTMLButtonElement>("difficulty");
+const valuesBtn = $<HTMLButtonElement>("values-fit");
+const newBtn = $<HTMLButtonElement>("new");
+const foundationHost = $<HTMLElement>("foundation");
+const compareHost = $<HTMLElement>("compare");
+const tabFoundation = $<HTMLButtonElement>("tab-foundation");
+const tabCompare = $<HTMLButtonElement>("tab-compare");
+const detailQa = $<HTMLElement>("detail-qa");
+const qaThread = $<HTMLElement>("qa-thread");
+const qaInput = $<HTMLTextAreaElement>("qa-input");
+const qaSend = $<HTMLButtonElement>("qa-send");
+const qaStatus = $<HTMLElement>("qa-status");
 const mbtiSelect = $<HTMLSelectElement>("mbti");
 const plansEl = $<HTMLUListElement>("plans");
 const treeHost = $<HTMLElement>("tree");
@@ -45,6 +59,7 @@ let treeDirty = false;
 let learningState: LearningState = "idle";
 let learningError: string | undefined;
 let studyMsg: { text?: string; error?: boolean } = {};
+let detailPathIndex: number | null = null;
 
 const view = new TreeView(treeHost, showDetail);
 const story = new StoryMapView(storyHost, {
@@ -53,6 +68,16 @@ const story = new StoryMapView(storyHost, {
   onFetchLearning: () => void fetchLearning(),
 });
 const growth = new GrowthView(growthHost);
+const foundation = new FoundationView(foundationHost, {
+  onMvvCandidates: (answers) => mvvCandidates(answers),
+  onConfirmMvv: (mvv) => confirmFoundation({ mvv }),
+  onKgiCandidates: () => kgiCandidates(),
+  onConfirmKgi: (kgi) => confirmFoundation({ kgi_spec: kgi }),
+  onKpis: () => makeKpis(),
+  onPaths: () => void foundationPaths(false),
+  onDuplicate: () => void duplicatePlan(),
+});
+const compare = new CompareView(compareHost, { onChoose: (i) => void chooseAndStory(i) });
 const calendar = new CalendarView(calendarHost, {
   onGenerate: (settings, regenerate) => void generateStudyPlan(settings, regenerate),
   onAllocate: (settings) => void allocateStudy(settings),
@@ -73,6 +98,12 @@ function setBusy(b: boolean) {
   enrichBtn.disabled = b || !current?.doc.paths?.length;
   downloadBtn.disabled = b || !current;
   fitBtn.disabled = b || !current?.doc.paths?.length || !mbtiSelect.value;
+  difficultyBtn.disabled = b || !current?.doc.paths?.length;
+  valuesBtn.disabled = b || !current?.doc.paths?.length || !current?.doc.mvv?.values?.length;
+  newBtn.disabled = b;
+  foundation.render(current?.doc ?? null, b);
+  compare.render(current?.doc ?? null, b);
+  qaSend.disabled = b || detailPathIndex == null;
   for (const btn of detailActions.querySelectorAll("button")) btn.disabled = b;
   for (const btn of calendarHost.querySelectorAll(".cal-actions button")) (btn as HTMLButtonElement).disabled = b;
 }
@@ -85,13 +116,89 @@ function payload(): Payload {
   const fd = new FormData(form);
   const model = String(fd.get("model") ?? "").trim();
   return {
-    kgi: fd.get("kgi"),
     context: fd.get("context"),
     n_paths: Number(fd.get("n_paths") || 4),
     horizon_years: Number(fd.get("horizon_years") || 10),
     model: model || null,
     mbti: String(fd.get("mbti") ?? "") || null,
   };
+}
+
+// ---------- 難しさ ----------
+
+async function computeDifficulty() {
+  if (!current || busy) return;
+  setBusy(true);
+  setStatus("各道の難しさを判定中… claude -p を呼んでいます（1 分程度）");
+  const t0 = Date.now();
+  try {
+    current = await api<PlanResponse>("/api/difficulty", {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ plan_id: current.plan.id, model: payload().model }),
+    });
+    show(current);
+    setTab("tree");
+    setStatus(`難しさを付けました (${secsSince(t0)}) — 道ノードに ★、道の詳細に内訳と一番の壁`);
+  } catch (e) {
+    setStatus(errMsg(e), true);
+  } finally {
+    setBusy(false);
+  }
+}
+
+// ---------- 道についての質問 ----------
+
+function renderQa() {
+  const idx = detailPathIndex;
+  const path = idx != null ? current?.doc.paths?.[idx] : undefined;
+  detailQa.hidden = !path;
+  if (!path) return;
+  const turns = path.qa ?? [];
+  qaThread.replaceChildren();
+  if (!turns.length) {
+    qaThread.append(Object.assign(document.createElement("p"), { className: "hint", textContent: "この道について気になることを聞けます。回答には道の情報・KGI・前提が使われます。" }));
+  }
+  for (const turn of turns) {
+    const q = document.createElement("div");
+    q.className = "qa-q";
+    q.textContent = turn.q;
+    const a = document.createElement("div");
+    a.className = "qa-a";
+    a.textContent = turn.a;
+    const at = document.createElement("div");
+    at.className = "qa-at";
+    at.textContent = fmtDate(turn.at);
+    qaThread.append(q, a, at);
+  }
+  qaThread.scrollTop = qaThread.scrollHeight;
+}
+
+async function askQuestion() {
+  const idx = detailPathIndex;
+  if (!current || busy || idx == null) return;
+  const question = qaInput.value.trim();
+  if (!question) {
+    qaStatus.textContent = "質問を入力してください";
+    return;
+  }
+  setBusy(true);
+  qaStatus.textContent = "回答中…（30〜90 秒）";
+  const t0 = Date.now();
+  try {
+    current = await api<PlanResponse & { answer: string }>("/api/qa", {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ plan_id: current.plan.id, path_index: idx, question, model: payload().model }),
+    });
+    qaInput.value = "";
+    renderQa();
+    qaStatus.textContent = `回答しました (${secsSince(t0)})`;
+  } catch (e) {
+    qaStatus.textContent = `失敗: ${errMsg(e)}`;
+  } finally {
+    setBusy(false);
+  }
 }
 
 // ---------- MBTI のおすすめ度 ----------
@@ -162,9 +269,16 @@ function setTab(t: Tab) {
   if (t === "story" && !chosenPath()?.path.story_map) t = "tree";
   if (t === "calendar" && !calendarAvailable()) t = "tree";
   if (t === "growth" && !chosenPath()?.path.study_plan) t = "tree";
+  if (t === "compare" && !current?.doc.paths?.length) t = "tree";
   tab = t;
+  emptyEl.hidden = !!current || t !== "tree";
   treeHost.hidden = t !== "tree";
   treeTools.hidden = t !== "tree";
+  foundationHost.hidden = t !== "foundation";
+  compareHost.hidden = t !== "compare";
+  tabFoundation.classList.toggle("active", t === "foundation");
+  tabCompare.classList.toggle("active", t === "compare");
+  tabCompare.disabled = !current?.doc.paths?.length;
   storyHost.hidden = t !== "story";
   calendarHost.hidden = t !== "calendar";
   growthHost.hidden = t !== "growth";
@@ -181,15 +295,15 @@ function setTab(t: Tab) {
 // ---------- 生成（道 / 深掘り / 一括） ----------
 
 async function generate(endpoint: Endpoint) {
-  const body = payload();
-  if (!String(body.kgi ?? "").trim()) {
-    setStatus("KGI を入力してください", true);
+  // 道は土台（KGI と共通 KPI）から出す。深掘りは開いているプラン（土台なしの旧プランも可）に対して
+  if (endpoint !== "enrich") {
+    if (current?.doc.kpi_tree) return void foundationPaths(endpoint === "full");
+    setStatus("「土台」タブで KGI と KPI を決めてから道を出してください", true);
+    setTab("foundation");
     return;
   }
-  if (endpoint === "enrich" && current) {
-    body.paths_doc = current.doc;
-    body.plan_id = current.plan.id;
-  }
+  if (!current?.doc.paths?.length) return;
+  const body: Payload = { ...payload(), kgi: current.plan.kgi, paths_doc: current.doc, plan_id: current.plan.id };
   setBusy(true);
   const label = { paths: "道を生成中", enrich: "各道を深掘り中", full: "一括生成中" }[endpoint];
   setStatus(`${label}… claude -p を呼んでいます（数十秒〜数分かかります）`);
@@ -204,6 +318,101 @@ async function generate(endpoint: Endpoint) {
   } finally {
     setBusy(false);
   }
+}
+
+// ---------- 土台（MVV → KGI → 共通 KPI）と、土台で道を出す ----------
+
+/** API を 1 つ呼んで current を差し替える。成功したら true */
+async function step(label: string, path: string, body: Record<string, unknown>, opts: { reload?: boolean } = {}): Promise<boolean> {
+  if (busy) return false;
+  setBusy(true);
+  setStatus(`${label}… claude -p を呼んでいます`);
+  const t0 = Date.now();
+  try {
+    current = await api<PlanResponse>(path, { method: "POST", headers: JSON_HEADERS, body: JSON.stringify(body) });
+    show(current);
+    setStatus(`${label}が完了しました (${secsSince(t0)}) — #${current.plan.id}`);
+    if (opts.reload !== false) await loadPlans();
+    return true;
+  } catch (e) {
+    setStatus(`${label}に失敗: ${errMsg(e)}`, true);
+    return false;
+  } finally {
+    setBusy(false);
+  }
+}
+
+function foundationBody(extra: Record<string, unknown>): Record<string, unknown> {
+  return { ...payload(), ...(current ? { plan_id: current.plan.id } : {}), ...extra };
+}
+
+function mvvCandidates(answers: MvvAnswer[]): Promise<boolean> {
+  return step("MVV の候補づくり", "/api/mvv", foundationBody({ answers }));
+}
+
+async function confirmFoundation(edit: { mvv?: Mvv; kgi_spec?: KgiSpec }): Promise<boolean> {
+  const ok = await step(edit.mvv ? "MVV の確定" : "KGI の確定", "/api/foundation", foundationBody(edit));
+  if (ok) setStatus(edit.mvv ? "MVV を確定しました。次は KGI です" : "KGI を確定しました。次は KPI です");
+  return ok;
+}
+
+function kgiCandidates(): Promise<boolean> {
+  return step("KGI の候補づくり", "/api/kgi", foundationBody({}));
+}
+
+function makeKpis(): Promise<boolean> {
+  return step("共通 KPI づくり", "/api/kpis", foundationBody({}));
+}
+
+async function valuesFit(): Promise<boolean> {
+  if (!current) return false;
+  const ok = await step("バリューとの合い具合の判定", "/api/values_fit", { plan_id: current.plan.id, model: payload().model });
+  if (ok) setTab("tree");
+  return ok;
+}
+
+/** 土台で道を出す → バリューとの合い具合 →（一括なら）深掘り */
+async function foundationPaths(withEnrich: boolean) {
+  if (!current?.doc.kpi_tree || busy) return;
+  if (current.doc.paths?.length && !confirm("道を作り直しますか？ 今の道と、その深掘り・評価は消えます")) return;
+  const ok = await step("道の生成（土台の KGI と共通 KPI で。3〜5 分）", "/api/paths", foundationBody({}));
+  if (!ok) return;
+  if (current?.doc.mvv?.values?.length) await valuesFit();
+  if (withEnrich) await generate("enrich");
+  setTab("tree");
+}
+
+async function duplicatePlan() {
+  if (!current || busy) return;
+  setBusy(true);
+  try {
+    current = await api<PlanResponse>(`/api/plans/${current.plan.id}/duplicate`, { method: "POST" });
+    foundation.reset(current.doc);
+    show(current);
+    setTab("foundation");
+    setStatus(`土台を複製して #${current.plan.id} を作りました。ここで MVV・KGI を直せます`);
+    await loadPlans();
+  } catch (e) {
+    setStatus(errMsg(e), true);
+  } finally {
+    setBusy(false);
+  }
+}
+
+function startNew() {
+  if (busy) return;
+  current = null;
+  view.clear();
+  story.clear();
+  calendar.clear();
+  growth.clear();
+  compare.clear();
+  foundation.reset(null);
+  clearDetail();
+  highlightPlan(-1);
+  setTab("foundation");
+  setBusy(false);
+  setStatus("新しいプラン: 質問に答えて MVV の候補を出すところから始めます");
 }
 
 // ---------- ストーリーマップ / 教材 ----------
@@ -375,8 +584,6 @@ function renderGrowth() {
 // ---------- 表示 ----------
 
 function show(r: PlanResponse) {
-  emptyEl.hidden = true;
-  const typed = String(new FormData(form).get("kgi") ?? "").trim();
   const cp = chosenPath();
   learningState = cp?.path.learning ? "done" : "idle";
   learningError = undefined;
@@ -384,8 +591,10 @@ function show(r: PlanResponse) {
   calendar.clear();
   renderStory();
   renderCalendar();
-  setTab(cp?.path.story_map ? "story" : "tree");
-  view.setRoot(toTree(r.doc, r.plan.kgi || typed || "KGI"));
+  foundation.render(r.doc, busy);
+  compare.render(r.doc, busy);
+  setTab(cp?.path.story_map ? "story" : r.doc.paths?.length ? "tree" : "foundation");
+  view.setRoot(toTree(r.doc, r.plan.kgi || r.plan.title || "KGI"));
   treeDirty = treeHost.hidden;
   clearDetail();
   highlightPlan(r.plan.id);
@@ -432,6 +641,10 @@ function showDetail(n: TreeNode, ancestors: TreeNode[]) {
   detailActions.replaceChildren();
 
   const m = /^path(\d+)$/.exec(n.id);
+  detailPathIndex = m && current ? Number(m[1]) : null;
+  renderQa();
+  qaStatus.textContent = "";
+  qaSend.disabled = busy || detailPathIndex == null;
   if (m && current) {
     const idx = Number(m[1]);
     const path = current.doc.paths?.[idx];
@@ -455,6 +668,8 @@ function showDetail(n: TreeNode, ancestors: TreeNode[]) {
 /** ストーリーマップのカードを選んだとき */
 function showCardDetail(card: StoryCard, phase: StoryPhase) {
   detailEmpty.hidden = true;
+  detailPathIndex = null;
+  detailQa.hidden = true;
   detailActions.replaceChildren();
   crumbsEl.textContent = `ストーリーマップ › ${phase.name} › ${laneLabel(card.lane)}`;
   detailTitle.textContent = card.title;
@@ -480,6 +695,8 @@ function showCardDetail(card: StoryCard, phase: StoryPhase) {
 /** カレンダーのセッションを選んだとき */
 function showSessionDetail(s: StudySession, done: boolean) {
   detailEmpty.hidden = true;
+  detailPathIndex = null;
+  detailQa.hidden = true;
   const d = parseDate(s.date);
   crumbsEl.textContent = `カレンダー › ${d.getMonth() + 1}/${d.getDate()}（${DOW_LABELS[(d.getDay() + 6) % 7]}）`;
   detailTitle.textContent = s.title;
@@ -509,6 +726,8 @@ function showSessionDetail(s: StudySession, done: boolean) {
 /** フェーズ見出しを選んだとき */
 function showPhaseDetail(phase: StoryPhase, index: number) {
   detailEmpty.hidden = true;
+  detailPathIndex = null;
+  detailQa.hidden = true;
   detailActions.replaceChildren();
   crumbsEl.textContent = "ストーリーマップ";
   detailTitle.textContent = `${index + 1}. ${phase.name}`;
@@ -524,6 +743,8 @@ function showPhaseDetail(phase: StoryPhase, index: number) {
 
 function clearDetail() {
   detailEmpty.hidden = false;
+  detailPathIndex = null;
+  detailQa.hidden = true;
   crumbsEl.textContent = "";
   detailTitle.textContent = "";
   detailActions.replaceChildren();
@@ -550,7 +771,8 @@ async function loadPlans() {
 
 function stageLabel(p: PlanRow): string {
   if (p.stage === "story") return p.chosen_path != null ? `決定済 道${p.chosen_path + 1}` : "決定済";
-  return p.stage === "enriched" ? "深掘り済" : "道のみ";
+  const labels: Record<string, string> = { mvv: "MVV", kgi: "KGI まで", kpi: "KPI まで", enriched: "深掘り済", paths: "道のみ" };
+  return labels[p.stage] ?? p.stage;
 }
 
 function renderPlanRow(p: PlanRow): HTMLLIElement {
@@ -585,9 +807,10 @@ function renderPlanRow(p: PlanRow): HTMLLIElement {
         story.clear();
         calendar.clear();
         growth.clear();
-        setTab("tree");
-        emptyEl.hidden = false;
+        compare.clear();
+        foundation.reset(null);
         clearDetail();
+        setTab("foundation");
         setBusy(false);
       }
       await loadPlans();
@@ -610,12 +833,12 @@ async function openPlan(id: number) {
   try {
     current = await api<PlanResponse>(`/api/plans/${id}`);
     const p = current.plan;
-    field<HTMLTextAreaElement>("kgi").value = p.kgi;
     field<HTMLTextAreaElement>("context").value = p.context;
     field<HTMLInputElement>("n_paths").value = String(p.n_paths);
     field<HTMLInputElement>("horizon_years").value = String(p.horizon_years);
     field<HTMLInputElement>("model").value = p.model ?? "";
     mbtiSelect.value = current.doc.mbti ?? "";
+    foundation.reset(current.doc);
     show(current);
     setStatus(`#${p.id} を開きました（${fmtDate(p.updated_at)} 保存）`);
     setBusy(false);
@@ -649,11 +872,20 @@ for (const tname of MBTI_TYPES) {
 }
 mbtiSelect.addEventListener("change", () => setBusy(busy));
 fitBtn.addEventListener("click", () => void fitPaths());
+difficultyBtn.addEventListener("click", () => void computeDifficulty());
+qaSend.addEventListener("click", () => void askQuestion());
+qaInput.addEventListener("keydown", (e) => {
+  if ((e.metaKey || e.ctrlKey) && e.key === "Enter") void askQuestion();
+});
+tabFoundation.addEventListener("click", () => setTab("foundation"));
+tabCompare.addEventListener("click", () => setTab("compare"));
+newBtn.addEventListener("click", startNew);
+valuesBtn.addEventListener("click", () => void valuesFit());
 tabTree.addEventListener("click", () => setTab("tree"));
 tabStory.addEventListener("click", () => setTab("story"));
 tabCalendar.addEventListener("click", () => setTab("calendar"));
 tabGrowth.addEventListener("click", () => setTab("growth"));
-$<HTMLButtonElement>("fit").addEventListener("click", () => view.fit());
+$<HTMLButtonElement>("fit-view").addEventListener("click", () => view.fit());
 $<HTMLButtonElement>("expand").addEventListener("click", () => view.expandAll());
 $<HTMLButtonElement>("collapse").addEventListener("click", () => view.collapseAll());
 
@@ -669,6 +901,7 @@ fetch("/api/health")
   });
 
 clearDetail();
-setTab("tree");
+foundation.reset(null);
+setTab("foundation");
 setBusy(false);
 void loadPlans().catch((e) => setStatus(errMsg(e), true));

@@ -1,5 +1,7 @@
 import { ClaudeError, loadPrompt, parseJsonResult, runClaudeP } from "./claude.ts";
 import type { SessionTemplate } from "./schedule.ts";
+import type { ConfirmedKgi, ConfirmedMvv, KpiTree, Mvv, MvvAnswer } from "./foundation.ts";
+import type { KgiSpec } from "./kgi.ts";
 
 const SYSTEM =
   "あなたはユーザーの人生KGIを設計する参謀です。推測で盛らず、トレードオフを明示し、測定できる指標だけを出す。出力は指定JSONのみ。";
@@ -15,7 +17,32 @@ export type PlanDoc = {
   /** 自己申告の MBTI（任意、参考情報） */
   mbti?: string;
   mbti_note?: string;
+  // ---- 土台（MVV → KGI → 共通 KPI）。src/foundation.ts ----
+  mvv_answers?: MvvAnswer[];
+  mvv_candidates?: Mvv[];
+  mvv?: ConfirmedMvv;
+  kgi_candidates?: KgiSpec[];
+  kgi_spec?: ConfirmedKgi;
+  kpi_tree?: KpiTree;
 };
+
+/** 道・深掘り・ストーリーマップ・質問のプロンプトに渡す土台。無いプラン（従来の KGI 直入力）では空。 */
+export function foundationInput(doc: PlanDoc): { mvv?: Mvv; kgi_spec?: KgiSpec; kpi_formula?: string; kpis?: KpiTree["kpis"] } {
+  const out: { mvv?: Mvv; kgi_spec?: KgiSpec; kpi_formula?: string; kpis?: KpiTree["kpis"] } = {};
+  if (doc.mvv) {
+    const { confirmed_at: _c, grounds: _g, ...m } = doc.mvv;
+    out.mvv = m;
+  }
+  if (doc.kgi_spec) {
+    const { confirmed_at: _c, ...k } = doc.kgi_spec;
+    out.kgi_spec = k;
+  }
+  if (doc.kpi_tree) {
+    if (doc.kpi_tree.formula) out.kpi_formula = doc.kpi_tree.formula;
+    out.kpis = doc.kpi_tree.kpis;
+  }
+  return out;
+}
 
 export type StoryLane = "do" | "learn" | "prove" | "measure";
 export const STORY_LANES: readonly StoryLane[] = ["do", "learn", "prove", "measure"];
@@ -38,7 +65,7 @@ export type Learning = { items: LearningItem[] };
 type AskOpts<T> = { validate?: (v: unknown) => T; tools?: string[]; maxTurns?: number; systemPrompt?: string; vars?: Record<string, string | number> };
 
 /** プロンプトを claude -p に投げて JSON を返す。JSON でない・形が不正な出力は 1 回だけ再試行する。 */
-async function ask<T>(file: string, userBlock: string, model?: string, opts: AskOpts<T> = {}): Promise<T> {
+export async function ask<T>(file: string, userBlock: string, model?: string, opts: AskOpts<T> = {}): Promise<T> {
   let system = await loadPrompt(file);
   for (const [k, v] of Object.entries(opts.vars ?? {})) system = system.split(`{${k}}`).join(String(v));
   const prompt = `${system}\n\n---\nユーザー入力:\n${userBlock}`;
@@ -67,6 +94,8 @@ export async function generatePaths(input: {
   n_paths?: number;
   model?: string;
   mbti?: string;
+  /** 土台（MVV・KGI・共通 KPI）。あれば道は KGI を言い換えず、kpi_plan を持つ */
+  foundation?: ReturnType<typeof foundationInput>;
 }): Promise<PlanDoc> {
   const n = input.n_paths ?? 4;
   const data = await ask<PlanDoc>(
@@ -78,6 +107,7 @@ export async function generatePaths(input: {
         horizon_years: input.horizon_years ?? 10,
         n_paths: n,
         ...(input.mbti ? { mbti: input.mbti } : {}),
+        ...(input.foundation ?? {}),
       },
       null,
       2,
@@ -95,9 +125,10 @@ export async function enrichPaths(
   model?: string,
 ): Promise<PlanDoc> {
   const paths = pathsDoc.paths ?? [];
+  const foundation = foundationInput(pathsDoc);
   const filled = await Promise.all(
     paths.map(async (p) => {
-      const payload = JSON.stringify({ kgi, path: p }, null, 2);
+      const payload = JSON.stringify({ kgi, ...foundation, path: p }, null, 2);
       const [skills, future] = await Promise.all([
         ask("skills_kpi.txt", payload, model),
         ask("future.txt", payload, model),
@@ -112,6 +143,12 @@ export async function enrichPaths(
     chosen_path: pathsDoc.chosen_path,
     mbti: pathsDoc.mbti,
     mbti_note: pathsDoc.mbti_note,
+    mvv_answers: pathsDoc.mvv_answers,
+    mvv_candidates: pathsDoc.mvv_candidates,
+    mvv: pathsDoc.mvv,
+    kgi_candidates: pathsDoc.kgi_candidates,
+    kgi_spec: pathsDoc.kgi_spec,
+    kpi_tree: pathsDoc.kpi_tree,
   };
 }
 
@@ -124,6 +161,18 @@ export async function runFull(input: {
 }): Promise<PlanDoc> {
   const base = await generatePaths(input);
   return enrichPaths(input.kgi, base, input.model);
+}
+
+// ---------- 道の要約（おすすめ度・難しさ・バリューの評価に渡す。重い入れ子は外す） ----------
+
+const HEAVY_KEYS = new Set(["skills_kpi", "future", "story_map", "learning", "study_plan", "mbti_fit", "difficulty", "values_fit", "qa"]);
+
+export function pathSummaries(paths: Record<string, unknown>[]) {
+  return paths.map((p, i) => ({
+    path: i,
+    name: String(p.name ?? `道 ${i + 1}`),
+    summary: Object.fromEntries(Object.entries(p).filter(([k]) => !HEAVY_KEYS.has(k) && k !== "name")),
+  }));
 }
 
 // ---------- ストーリーマップ / 学習教材 ----------
@@ -194,7 +243,7 @@ export function normalizeLearning(v: unknown): Learning {
 }
 
 export async function generateStoryMap(
-  input: { kgi: string; context?: string; horizon_years?: number; path: Record<string, unknown> },
+  input: { kgi: string; context?: string; horizon_years?: number; path: Record<string, unknown> } & ReturnType<typeof foundationInput>,
   model?: string,
 ): Promise<StoryMap> {
   return ask<StoryMap>("story_map.txt", JSON.stringify(input, null, 2), model, { validate: normalizeStoryMap });
@@ -294,4 +343,75 @@ export type MbtiFitInput = { mbti: MbtiType; kgi: string; context?: string; path
 
 export async function generateMbtiFit(input: MbtiFitInput, model?: string): Promise<{ fits: (MbtiFit | undefined)[]; note?: string }> {
   return ask("mbti_fit.txt", JSON.stringify(input, null, 2), model, { validate: (v) => normalizeMbtiFit(v, input.paths.length) });
+}
+
+// ---------- 道の難しさ（★1〜5 ＋ 観点別） ----------
+
+export const DIFFICULTY_ASPECTS = ["time", "money", "skill_gap", "uncertainty", "life_load"] as const;
+export type DifficultyAspect = (typeof DIFFICULTY_ASPECTS)[number];
+export type Difficulty = { overall: number; aspects: Record<DifficultyAspect, number>; wall?: string; reason?: string };
+
+function clamp15(v: unknown): number | undefined {
+  const n = Math.round(Number(v));
+  return Number.isFinite(n) && v != null && v !== "" ? Math.min(5, Math.max(1, n)) : undefined;
+}
+
+/** claude の出力を道ごとの Difficulty に並べる。overall が無ければ観点の最大値。何も無ければ投げる。 */
+export function normalizeDifficulty(v: unknown, nPaths: number): (Difficulty | undefined)[] {
+  const out: (Difficulty | undefined)[] = Array.from({ length: nPaths }, () => undefined);
+  const rows = isObj(v) && Array.isArray(v.paths) ? v.paths : [];
+  let n = 0;
+  for (const r of rows) {
+    if (!isObj(r)) continue;
+    const idx = Number(r.path);
+    if (!Number.isInteger(idx) || idx < 0 || idx >= nPaths) continue;
+    const a = isObj(r.aspects) ? r.aspects : {};
+    const aspects = {} as Record<DifficultyAspect, number>;
+    let any = false;
+    for (const k of DIFFICULTY_ASPECTS) {
+      const val = clamp15(a[k]);
+      if (val != null) any = true;
+      aspects[k] = val ?? 3;
+    }
+    const overall = clamp15(r.overall) ?? (any ? Math.max(...DIFFICULTY_ASPECTS.map((k) => aspects[k])) : undefined);
+    if (overall == null) continue;
+    out[idx] = { overall, aspects, wall: str(r.wall), reason: str(r.reason) };
+    n++;
+  }
+  if (!n) throw new ClaudeError("difficulty の形式が不正（paths が空）");
+  return out;
+}
+
+export type DifficultyInput = { kgi: string; context?: string; horizon_years?: number; paths: { path: number; name: string; summary: Record<string, unknown> }[] } & ReturnType<typeof foundationInput>;
+
+export async function generateDifficulty(input: DifficultyInput, model?: string): Promise<(Difficulty | undefined)[]> {
+  return ask("difficulty.txt", JSON.stringify(input, null, 2), model, { validate: (v) => normalizeDifficulty(v, input.paths.length) });
+}
+
+// ---------- 道についての質問（本文テキストで返す） ----------
+
+const SYSTEM_QA = "あなたは人生設計の相談相手です。渡された道の情報と KGI・context を根拠に、日本語で簡潔に答える。出力は回答本文だけ。";
+const QA_HISTORY = 6;
+
+export type QaTurn = { q: string; a: string; at: string };
+export type QaInput = ReturnType<typeof foundationInput> & {
+  kgi: string;
+  context?: string;
+  mbti?: string;
+  path: Record<string, unknown>;
+  history: { q: string; a: string }[];
+  question: string;
+};
+
+/** JSON ではなく本文テキストを返す問い合わせ。空なら 1 回だけ再試行。 */
+export async function answerQuestion(input: QaInput, model?: string): Promise<string> {
+  const system = await loadPrompt("qa.txt");
+  const block = JSON.stringify({ ...input, history: input.history.slice(-QA_HISTORY) }, null, 2);
+  const prompt = `${system}\n\n---\nユーザー入力:\n${block}`;
+  for (let attempt = 1; ; attempt++) {
+    const raw = (await runClaudeP(prompt, { systemPrompt: SYSTEM_QA, model, label: `qa.txt#${attempt}` })).trim();
+    if (raw) return raw;
+    console.error(`[engine] qa.txt#${attempt} 空の回答`);
+    if (attempt >= 2) throw new ClaudeError("回答が空でした");
+  }
 }
